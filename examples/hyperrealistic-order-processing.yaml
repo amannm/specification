@@ -62,6 +62,10 @@ use:
       type: https://ecommerce.example.com/errors/delivery-timeout
       status: 504
       title: Delivery Timeout
+    paymentDeclined:
+      type: https://ecommerce.example.com/errors/payment-declined
+      status: 402
+      title: Payment Declined
   extensions:
     - logDuration:
         extend: run
@@ -153,26 +157,44 @@ do:
           total: ${ $context.order.total }
       then: chargeCustomer
   - chargeCustomer:
-      call: http
-      with:
-        method: post
-        endpoint:
-          uri: https://api.stripe.com/v1/payment_intents
-          authentication:
-            use: paymentService
-        headers:
-          content-type: application/x-www-form-urlencoded
-        body:
-          amount: ${ $context.order.total * 100 }
-          currency: usd
-          customer: ${ $context.order.customer.stripeId }
-      retry:
-        when:
-          - error:
-              type: >-
-                https://serverlessworkflow.io/spec/1.0.0/errors/communication
-        interval: PT30S
-        maxAttempts: 3
+      try:
+        - attemptCharge:
+            call: http
+            with:
+              method: post
+              endpoint:
+                uri: https://api.stripe.com/v1/payment_intents
+                authentication:
+                  use: paymentService
+              headers:
+                content-type: application/x-www-form-urlencoded
+              body:
+                amount: ${ $context.order.total * 100 }
+                currency: usd
+                customer: ${ $context.order.customer.stripeId }
+            retry:
+              when:
+                - error:
+                    type: >-
+                      https://serverlessworkflow.io/spec/1.0.0/errors/communication
+              interval: PT30S
+              maxAttempts: 3
+      catch:
+        errors:
+          with:
+            status: 402
+        do:
+          - notifyPaymentFailure:
+              run:
+                script:
+                  image: notifications-cli:1.0
+                  cmd: ["send"]
+                  arguments:
+                    email: ${ $context.order.customer.email }
+                    template: payment-failed
+          - raisePaymentDeclined:
+              raise:
+                errorRef: paymentDeclined
       then: listenForPaymentConfirmation
   - listenForPaymentConfirmation:
       call: asyncapi
@@ -213,6 +235,7 @@ do:
         body:
           items: ${ $context.order.items }
         redirect: true
+        authentication: shippingApi
       then: scheduleWarehouseTransfer
   - scheduleWarehouseTransfer:
       call: openapi
@@ -398,6 +421,18 @@ do:
           content-type: application/x-www-form-urlencoded
         body:
           payment_intent: ${ $context.order.paymentIntent }
+      then: updateCRMReturn
+  - updateCRMReturn:
+      call: openapi
+      with:
+        document:
+          endpoint: https://salesforce.example.com/openapi.yaml
+        operationId: updateOrderStatus
+        parameters:
+          orderId: ${ $context.order.id }
+        body:
+          status: returned
+        authentication: salesforce
       then: updateAccounting
   - updateAccounting:
       call: openapi
