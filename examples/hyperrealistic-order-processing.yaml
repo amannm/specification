@@ -1,0 +1,295 @@
+document:
+  dsl: '1.0.0'
+  namespace: business
+  name: hyperrealistic-order-processing
+  version: '0.1.0'
+input:
+  - order
+use:
+  authentications:
+    shippingApi:
+      http:
+        security:
+          bearer:
+            env: SHIPPING_TOKEN
+    paymentService:
+      http:
+        security:
+          oauth2:
+            grantType: clientCredentials
+            tokenUrl: https://api.stripe.com/oauth/token
+            scopes:
+              - charges:write
+    salesforce:
+      http:
+        security:
+          oauth2:
+            grantType: clientCredentials
+            tokenUrl: https://login.salesforce.com/services/oauth2/token
+            scopes:
+              - api
+    analyticsApi:
+      http:
+        security:
+          bearer:
+            env: ANALYTICS_TOKEN
+    loyaltyService:
+      http:
+        security:
+          oauth2:
+            grantType: clientCredentials
+            tokenUrl: https://loyalty.example.com/oauth/token
+            scopes:
+              - loyalty:write
+  errors:
+    itemOutOfStock:
+      type: https://ecommerce.example.com/errors/out-of-stock
+      status: 409
+      title: Item Out of Stock
+    deliveryTimeout:
+      type: https://ecommerce.example.com/errors/delivery-timeout
+      status: 504
+      title: Delivery Timeout
+  extensions:
+    - logDuration:
+        extend: run
+        after:
+          - log:
+              run:
+                script:
+                  language: bash
+                  code: |
+                    echo "Task took $TASK_DURATION seconds"
+schedule:
+  on:
+    one:
+      with:
+        type: com.ecommerce.events.order.placed.v1
+        data: ${ .orderId != null }
+do:
+  - initializeOrder:
+      set:
+        order: ${ $workflow.input.order }
+  - publishOrderCreated:
+      call: asyncapi
+      with:
+        document:
+          endpoint: https://messaging.example.com/asyncapi.json
+        operation: publishOrderCreated
+        protocol: kafka
+        message:
+          payload:
+            order: ${ $context.order }
+  - verifyInventory:
+      call: openapi
+      with:
+        document:
+          endpoint: https://inventory.example.com/openapi.json
+        operationId: checkInventory
+        parameters:
+          ids: ${ $context.order.items[*].id }
+      output:
+        as: .inventory
+  - checkInventory:
+      switch:
+        - available:
+            when: ${ all($context.inventory[*].status == 'available') }
+            then: chargeCustomer
+        - unavailable:
+            when: ${ any($context.inventory[*].status == 'unavailable') }
+            then: raiseItemOutOfStock
+  - chargeCustomer:
+      call: http
+      with:
+        method: post
+        endpoint: https://api.stripe.com/v1/payment_intents
+        authentication: paymentService
+        headers:
+          content-type: application/x-www-form-urlencoded
+        body:
+          amount: ${ $context.order.total * 100 }
+          currency: usd
+          customer: ${ $context.order.customer.stripeId }
+      retry:
+        when:
+          - error:
+              type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+        interval: PT30S
+        maxAttempts: 3
+      then: listenForPaymentConfirmation
+  - listenForPaymentConfirmation:
+      call: asyncapi
+      with:
+        document:
+          endpoint: https://messaging.example.com/asyncapi.json
+        operation: paymentProcessed
+        protocol: kafka
+        subscription:
+          filter: ${ .orderId == $context.order.id }
+          consume:
+            amount: 1
+      then: packageItems
+  - packageItems:
+      for:
+        each: item
+        in: $context.order.items
+      do:
+        - pack:
+            run:
+              container:
+                image: packing-service:latest
+                command: ["pack", "${ $item.id }"]
+      then: startShipping
+  - startShipping:
+      run:
+        workflow:
+          namespace: shipping
+          name: start-shipping
+          version: '0.1.0'
+          input:
+            order: ${ $context.order }
+      then: waitForShipping
+  - waitForShipping:
+      listen:
+        to:
+          one:
+            with:
+              type: com.shipping.events.shipped.v1
+              data: ${ .orderId == $context.order.id }
+      export:
+        as: $context + { shipping: .data }
+      timeout:
+        after:
+          hours: 24
+        then: raiseShippingTimeout
+      then: updateCRM
+  - updateCRM:
+      call: openapi
+      with:
+        document:
+          endpoint: https://salesforce.example.com/openapi.yaml
+        operationId: updateOrderStatus
+        parameters:
+          orderId: ${ $context.order.id }
+        body:
+          status: shipped
+        authentication: salesforce
+      then: sendConfirmation
+  - sendConfirmation:
+      run:
+        script:
+          image: notifications-cli:1.0
+          cmd: ["send", "--email", "${ $context.order.customer.email }", "--template", "shipped"]
+      then: waitForDelivery
+  - waitForDelivery:
+      listen:
+        to:
+          one:
+            with:
+              type: com.shipping.events.delivered.v1
+              data: ${ .orderId == $context.order.id }
+      timeout:
+        after:
+          days: 7
+        then: raiseDeliveryTimeout
+      then: updateDeliveryStatus
+  - updateDeliveryStatus:
+      call: openapi
+      with:
+        document:
+          endpoint: https://salesforce.example.com/openapi.yaml
+        operationId: updateOrderStatus
+        parameters:
+          orderId: ${ $context.order.id }
+        body:
+          status: delivered
+        authentication: salesforce
+      then: grantLoyaltyPoints
+  - grantLoyaltyPoints:
+      call: openapi
+      with:
+        document:
+          endpoint: https://loyalty.example.com/openapi.yaml
+        operationId: addPoints
+        parameters:
+          customerId: ${ $context.order.customer.id }
+        body:
+          points: ${ $context.order.total / 10 }
+        authentication: loyaltyService
+      then: sendSatisfactionSurvey
+  - sendSatisfactionSurvey:
+      run:
+        script:
+          image: marketing-cli:latest
+          cmd: ["survey", "--email", "${ $context.order.customer.email }"]
+      then: updateAnalytics
+  - updateAnalytics:
+      call: http
+      with:
+        method: post
+        endpoint: https://analytics.example.com/orders
+        authentication: analyticsApi
+        body:
+          orderId: ${ $context.order.id }
+          total: ${ $context.order.total }
+      then: monitorReturns
+  - monitorReturns:
+      listen:
+        to:
+          one:
+            with:
+              type: com.ecommerce.events.return.initiated.v1
+              data: ${ .orderId == $context.order.id }
+      timeout:
+        after:
+          days: 30
+        then: end
+      then: processReturn
+  - processReturn:
+      run:
+        workflow:
+          namespace: returns
+          name: handle-return
+          version: '0.1.0'
+          input:
+            order: ${ $context.order }
+      then: refundCustomer
+  - refundCustomer:
+      call: http
+      with:
+        method: post
+        endpoint: https://api.stripe.com/v1/refunds
+        authentication: paymentService
+        headers:
+          content-type: application/x-www-form-urlencoded
+        body:
+          payment_intent: ${ $context.order.paymentIntent }
+      then: updateStock
+  - updateStock:
+      call: openapi
+      with:
+        document:
+          endpoint: https://inventory.example.com/openapi.json
+        operationId: restock
+        parameters:
+          ids: ${ $context.order.items[*].id }
+      then: end
+  - raiseDeliveryTimeout:
+      raise:
+        errorRef: deliveryTimeout
+      then: end
+  - raiseItemOutOfStock:
+      raise:
+        errorRef: itemOutOfStock
+      then: end
+  - raiseShippingTimeout:
+      raise:
+        error:
+          type: https://ecommerce.example.com/errors/shipping-timeout
+          status: 504
+          title: Shipping Timeout
+      then: end
+
+timeout:
+  after:
+    hours: 2
