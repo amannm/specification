@@ -109,7 +109,38 @@ do:
             then: assessRisk
         - unavailable:
             when: ${ any($context.inventory[*].status == 'unavailable') }
-            then: raiseItemOutOfStock
+            then: startManufacturing
+  - startManufacturing:
+      call: openapi
+      with:
+        document:
+          endpoint: https://manufacturing.example.com/openapi.yaml
+        operationId: createWorkOrder
+        parameters:
+          orderId: ${ $context.order.id }
+          items: ${ $context.order.items }
+      then: waitForManufacturing
+  - waitForManufacturing:
+      listen:
+        to:
+          one:
+            with:
+              type: com.manufacturing.events.workorder.completed.v1
+              data: ${ .orderId == $context.order.id }
+      timeout:
+        after:
+          days: 2
+        then: raiseManufacturingTimeout
+      then: updateInventoryAfterManufacturing
+  - updateInventoryAfterManufacturing:
+      call: openapi
+      with:
+        document:
+          endpoint: https://inventory.example.com/openapi.json
+        operationId: updateStock
+        parameters:
+          ids: ${ $context.order.items[*].id }
+      then: assessRisk
   - assessRisk:
       call: openapi
       with:
@@ -314,6 +345,25 @@ do:
         operationId: analyzeDemand
         parameters:
           orderId: ${ $context.order.id }
+      then: checkSupplierCapacity
+  - checkSupplierCapacity:
+      call: openapi
+      with:
+        document:
+          endpoint: https://supply.example.com/openapi.yaml
+        operationId: checkSuppliers
+        parameters:
+          orderId: ${ $context.order.id }
+      then: adjustProductionPlan
+  - adjustProductionPlan:
+      call: openapi
+      with:
+        document:
+          endpoint: https://manufacturing.example.com/openapi.yaml
+        operationId: updateProductionPlan
+        parameters:
+          orderId: ${ $context.order.id }
+          demand: ${ $context.order.total }
       then: monitorReturns
   - monitorReturns:
       listen:
@@ -392,9 +442,12 @@ do:
       raise:
         errorRef: deliveryTimeout
       then: end
-  - raiseItemOutOfStock:
+  - raiseManufacturingTimeout:
       raise:
-        errorRef: itemOutOfStock
+        error:
+          type: https://ecommerce.example.com/errors/manufacturing-timeout
+          status: 504
+          title: Manufacturing Timeout
       then: end
   - raiseShippingTimeout:
       raise:
