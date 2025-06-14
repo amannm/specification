@@ -157,7 +157,7 @@ do:
               type: com.shipping.events.shipped.v1
               data: ${ .orderId == $context.order.id }
       export:
-        as: $context + { shipping: .data }
+        as: "$context + { shipping: .data }"
       timeout:
         after:
           hours: 24
