@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../schema/workflow.yaml
 document:
   dsl: '1.0.0'
   namespace: business
@@ -6,6 +7,14 @@ document:
 input:
   from:
     order: .order
+  schema:
+    format: json
+    document:
+      type: object
+      required: [order]
+      properties:
+        order:
+          type: object
 use:
   secrets:
     - SHIPPING_TOKEN
@@ -97,10 +106,21 @@ do:
       switch:
         - available:
             when: ${ all($context.inventory[*].status == 'available') }
-            then: chargeCustomer
+            then: assessRisk
         - unavailable:
             when: ${ any($context.inventory[*].status == 'unavailable') }
             then: raiseItemOutOfStock
+  - assessRisk:
+      call: openapi
+      with:
+        document:
+          endpoint: https://risk.example.com/openapi.yaml
+        operationId: evaluateOrderRisk
+        parameters:
+          orderId: ${ $context.order.id }
+        body:
+          total: ${ $context.order.total }
+      then: chargeCustomer
   - chargeCustomer:
       call: http
       with:
@@ -118,7 +138,8 @@ do:
       retry:
         when:
           - error:
-              type: https://serverlessworkflow.io/spec/1.0.0/errors/communication
+              type: >-
+                https://serverlessworkflow.io/spec/1.0.0/errors/communication
         interval: PT30S
         maxAttempts: 3
       then: listenForPaymentConfirmation
@@ -144,6 +165,11 @@ do:
               container:
                 image: packing-service:latest
                 command: ["pack", "${ $item.id }"]
+                name: ${ "pack-\($item.id)-\($workflow.id)" }
+                lifetime:
+                  cleanup: eventually
+                  after:
+                    minutes: 10
       then: createShipment
   - createShipment:
       call: openapi
@@ -155,6 +181,7 @@ do:
           orderId: ${ $context.order.id }
         body:
           items: ${ $context.order.items }
+        redirect: true
       then: scheduleWarehouseTransfer
   - scheduleWarehouseTransfer:
       call: openapi
@@ -216,7 +243,10 @@ do:
       run:
         script:
           image: notifications-cli:1.0
-          cmd: ["send", "--email", "${ $context.order.customer.email }", "--template", "shipped"]
+          cmd: ["send"]
+          arguments:
+            email: ${ $context.order.customer.email }
+            template: shipped
       then: waitForDelivery
   - waitForDelivery:
       listen:
@@ -253,24 +283,28 @@ do:
         body:
           points: ${ $context.order.total / 10 }
         authentication: loyaltyService
-      then: sendSatisfactionSurvey
-  - sendSatisfactionSurvey:
-      run:
-        script:
-          image: marketing-cli:latest
-          cmd: ["survey", "--email", "${ $context.order.customer.email }"]
-      then: updateAnalytics
-  - updateAnalytics:
-      call: http
-      with:
-        method: post
-        endpoint:
-          uri: https://analytics.example.com/orders
-          authentication:
-            use: analyticsApi
-        body:
-          orderId: ${ $context.order.id }
-          total: ${ $context.order.total }
+      then: finalizeCustomerExperience
+  - finalizeCustomerExperience:
+      fork:
+        branches:
+          - sendSatisfactionSurvey:
+              run:
+                script:
+                  image: marketing-cli:latest
+                  cmd: ["survey"]
+                  arguments:
+                    email: ${ $context.order.customer.email }
+          - updateAnalytics:
+              call: http
+              with:
+                method: post
+                endpoint:
+                  uri: https://analytics.example.com/orders
+                  authentication:
+                    use: analyticsApi
+                body:
+                  orderId: ${ $context.order.id }
+                  total: ${ $context.order.total }
       then: manageSupplyChain
   - manageSupplyChain:
       call: openapi
@@ -314,6 +348,17 @@ do:
           content-type: application/x-www-form-urlencoded
         body:
           payment_intent: ${ $context.order.paymentIntent }
+      then: updateAccounting
+  - updateAccounting:
+      call: openapi
+      with:
+        document:
+          endpoint: https://accounting.example.com/openapi.yaml
+        operationId: recordRefund
+        parameters:
+          orderId: ${ $context.order.id }
+        body:
+          amount: ${ $context.order.total }
       then: updateStock
   - updateStock:
       call: openapi
@@ -333,6 +378,15 @@ do:
         parameters:
           orderId: ${ $context.order.id }
           items: ${ $context.order.items }
+      then: emitCompletion
+  - emitCompletion:
+      emit:
+        event:
+          with:
+            source: https://ecommerce.example.com
+            type: com.ecommerce.events.order.completed.v1
+            data:
+              orderId: ${ $context.order.id }
       then: end
   - raiseDeliveryTimeout:
       raise:
