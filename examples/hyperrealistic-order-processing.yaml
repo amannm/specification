@@ -4,43 +4,46 @@ document:
   name: hyperrealistic-order-processing
   version: '0.1.0'
 input:
-  - order
+  from:
+    order: .order
 use:
+  secrets:
+    - SHIPPING_TOKEN
+    - ANALYTICS_TOKEN
   authentications:
     shippingApi:
-      http:
-        security:
-          bearer:
-            env: SHIPPING_TOKEN
+      bearer:
+        use: SHIPPING_TOKEN
     paymentService:
-      http:
-        security:
-          oauth2:
-            grantType: clientCredentials
-            tokenUrl: https://api.stripe.com/oauth/token
-            scopes:
-              - charges:write
+      oauth2:
+        authority: https://api.stripe.com
+        endpoints:
+          token: /oauth/token
+        grant: client_credentials
+        client:
+          id: stripe-client-id
+          secret: stripe-client-secret
     salesforce:
-      http:
-        security:
-          oauth2:
-            grantType: clientCredentials
-            tokenUrl: https://login.salesforce.com/services/oauth2/token
-            scopes:
-              - api
+      oauth2:
+        authority: https://login.salesforce.com
+        endpoints:
+          token: /services/oauth2/token
+        grant: client_credentials
+        client:
+          id: salesforce-client-id
+          secret: salesforce-client-secret
     analyticsApi:
-      http:
-        security:
-          bearer:
-            env: ANALYTICS_TOKEN
+      bearer:
+        use: ANALYTICS_TOKEN
     loyaltyService:
-      http:
-        security:
-          oauth2:
-            grantType: clientCredentials
-            tokenUrl: https://loyalty.example.com/oauth/token
-            scopes:
-              - loyalty:write
+      oauth2:
+        authority: https://loyalty.example.com
+        endpoints:
+          token: /oauth/token
+        grant: client_credentials
+        client:
+          id: loyalty-client-id
+          secret: loyalty-client-secret
   errors:
     itemOutOfStock:
       type: https://ecommerce.example.com/errors/out-of-stock
@@ -102,8 +105,10 @@ do:
       call: http
       with:
         method: post
-        endpoint: https://api.stripe.com/v1/payment_intents
-        authentication: paymentService
+        endpoint:
+          uri: https://api.stripe.com/v1/payment_intents
+          authentication:
+            use: paymentService
         headers:
           content-type: application/x-www-form-urlencoded
         body:
@@ -139,6 +144,38 @@ do:
               container:
                 image: packing-service:latest
                 command: ["pack", "${ $item.id }"]
+      then: createShipment
+  - createShipment:
+      call: openapi
+      with:
+        document:
+          endpoint: https://logistics.example.com/openapi.yaml
+        operationId: createShipment
+        parameters:
+          orderId: ${ $context.order.id }
+        body:
+          items: ${ $context.order.items }
+      then: scheduleWarehouseTransfer
+  - scheduleWarehouseTransfer:
+      call: openapi
+      with:
+        document:
+          endpoint: https://logistics.example.com/openapi.yaml
+        operationId: routeToWarehouse
+        parameters:
+          orderId: ${ $context.order.id }
+      then: waitForWarehousePickup
+  - waitForWarehousePickup:
+      listen:
+        to:
+          one:
+            with:
+              type: com.logistics.events.warehouse.pickedUp.v1
+              data: ${ .orderId == $context.order.id }
+      timeout:
+        after:
+          hours: 4
+        then: raiseDeliveryTimeout
       then: startShipping
   - startShipping:
       run:
@@ -227,11 +264,22 @@ do:
       call: http
       with:
         method: post
-        endpoint: https://analytics.example.com/orders
-        authentication: analyticsApi
+        endpoint:
+          uri: https://analytics.example.com/orders
+          authentication:
+            use: analyticsApi
         body:
           orderId: ${ $context.order.id }
           total: ${ $context.order.total }
+      then: manageSupplyChain
+  - manageSupplyChain:
+      call: openapi
+      with:
+        document:
+          endpoint: https://supply.example.com/openapi.yaml
+        operationId: analyzeDemand
+        parameters:
+          orderId: ${ $context.order.id }
       then: monitorReturns
   - monitorReturns:
       listen:
@@ -258,8 +306,10 @@ do:
       call: http
       with:
         method: post
-        endpoint: https://api.stripe.com/v1/refunds
-        authentication: paymentService
+        endpoint:
+          uri: https://api.stripe.com/v1/refunds
+          authentication:
+            use: paymentService
         headers:
           content-type: application/x-www-form-urlencoded
         body:
@@ -273,6 +323,16 @@ do:
         operationId: restock
         parameters:
           ids: ${ $context.order.items[*].id }
+      then: notifySuppliers
+  - notifySuppliers:
+      call: openapi
+      with:
+        document:
+          endpoint: https://suppliers.example.com/openapi.yaml
+        operationId: notifyReturn
+        parameters:
+          orderId: ${ $context.order.id }
+          items: ${ $context.order.items }
       then: end
   - raiseDeliveryTimeout:
       raise:
