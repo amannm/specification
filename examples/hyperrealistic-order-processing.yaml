@@ -134,7 +134,6 @@ do:
       timeout:
         after:
           days: 2
-        then: raiseManufacturingTimeout
       then: updateInventoryAfterManufacturing
   - updateInventoryAfterManufacturing:
       call: openapi
@@ -153,8 +152,6 @@ do:
         operationId: evaluateOrderRisk
         parameters:
           orderId: ${ $context.order.id }
-        body:
-          total: ${ $context.order.total }
       then: chargeCustomer
   - chargeCustomer:
       try:
@@ -172,13 +169,6 @@ do:
                 amount: ${ $context.order.total * 100 }
                 currency: usd
                 customer: ${ $context.order.customer.stripeId }
-            retry:
-              when:
-                - error:
-                    type: >-
-                      https://serverlessworkflow.io/spec/1.0.0/errors/communication
-              interval: PT30S
-              maxAttempts: 3
       catch:
         errors:
           with:
@@ -186,12 +176,12 @@ do:
         do:
           - notifyPaymentFailure:
               run:
-                script:
+                container:
                   image: notifications-cli:1.0
-                  cmd: ["send"]
-                  arguments:
-                    email: ${ $context.order.customer.email }
-                    template: payment-failed
+                  command: send
+                  environment:
+                    EMAIL: ${ $context.order.customer.email }
+                    TEMPLATE: payment-failed
           - raisePaymentDeclined:
               raise:
                 errorRef: paymentDeclined
@@ -256,7 +246,6 @@ do:
       timeout:
         after:
           hours: 4
-        then: raiseDeliveryTimeout
       then: startShipping
   - startShipping:
       run:
@@ -279,7 +268,6 @@ do:
       timeout:
         after:
           hours: 24
-        then: raiseShippingTimeout
       then: updateCRM
   - updateCRM:
       call: openapi
@@ -312,7 +300,6 @@ do:
       timeout:
         after:
           days: 7
-        then: raiseDeliveryTimeout
       then: updateDeliveryStatus
   - updateDeliveryStatus:
       call: openapi
@@ -398,7 +385,6 @@ do:
       timeout:
         after:
           days: 30
-        then: end
       then: processReturn
   - processReturn:
       run:
