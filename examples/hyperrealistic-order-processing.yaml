@@ -261,6 +261,12 @@ do:
                   cleanup: eventually
                   after:
                     minutes: 10
+      then: verifyPackaging
+  - verifyPackaging:
+      run:
+        container:
+          image: qa-cli:latest
+          command: ${ "inspect \($context.order.id)" }
       then: createShipment
   - createShipment:
       call: openapi
@@ -271,6 +277,17 @@ do:
         parameters:
           orderId: ${ $context.order.id }
         redirect: true
+        authentication:
+          use: shippingApi
+      then: generateShippingLabel
+  - generateShippingLabel:
+      call: openapi
+      with:
+        document:
+          endpoint: https://shipping.mycorp.com/fedex/openapi.yaml
+        operationId: createLabel
+        parameters:
+          orderId: ${ $context.order.id }
         authentication:
           use: shippingApi
       then: scheduleWarehouseTransfer
