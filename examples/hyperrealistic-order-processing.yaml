@@ -3,7 +3,7 @@ document:
   dsl: '1.0.0'
   namespace: business
   name: hyperrealistic-order-processing
-  version: '0.1.0'
+  version: '0.2.0'
 input:
   from:
     order: .order
@@ -19,6 +19,7 @@ use:
   secrets:
     - SHIPPING_TOKEN
     - ANALYTICS_TOKEN
+    - INVOICE_TOKEN
   authentications:
     shippingApi:
       bearer:
@@ -451,6 +452,99 @@ do:
             type: com.ecommerce.events.order.completed.v1
             data:
               orderId: ${ $context.order.id }
+      then: finalEnterpriseProcesses
+  - finalEnterpriseProcesses:
+      do:
+        - updateERP:
+            call: openapi
+            with:
+              document:
+                endpoint: https://erp.example.com/openapi.yaml
+              operationId: updateOrder
+              parameters:
+                orderId: ${ $context.order.id }
+        - generateInvoice:
+            run:
+              container:
+                image: invoicing-cli:latest
+                command: ${ "generate-invoice \($context.order.id)" }
+                environment:
+                  INVOICE_TOKEN: ${ $secrets.INVOICE_TOKEN }
+                lifetime:
+                  cleanup: eventually
+                  after:
+                    minutes: 5
+        - notifyCompliance:
+            call: http
+            with:
+              method: post
+              endpoint:
+                uri: https://compliance.example.com/report
+              headers:
+                content-type: application/json
+              body:
+                orderId: ${ $context.order.id }
+                total: ${ $context.order.total }
+        - evaluateLoyaltyStatus:
+            set:
+              loyaltyStatus: "${ $context.order.total > 1000 ? 'gold' : 'standard' }"
+        - updateDataWarehouse:
+            run:
+              workflow:
+                namespace: analytics
+                name: data-warehouse-ingest
+                version: "0.1.0"
+                input:
+                  order: ${ $context.order }
+        - sendMarketing:
+            fork:
+              branches:
+                - sendPromoEmail:
+                    run:
+                      container:
+                        image: marketing-cli:latest
+                        command: email
+                        environment:
+                          TO: ${ $context.order.customer.email }
+                          TEMPLATE: upsell
+                - sendPromoSMS:
+                    run:
+                      container:
+                        image: marketing-cli:latest
+                        command: sms
+                        environment:
+                          PHONE: ${ $context.order.customer.phone }
+                          TEMPLATE: upsell
+                - updateAdCampaign:
+                    call: openapi
+                    with:
+                      document:
+                        endpoint: https://ads.example.com/openapi.yaml
+                      operationId: recordConversion
+                      parameters:
+                        campaignId: 42
+                        orderId: ${ $context.order.id }
+        - orchestrateProcurement:
+            call: grpc
+            with:
+              proto:
+                endpoint: file://protos/procurement.proto
+              service:
+                name: ProcurementApi.Manager
+                host: procurement-example-com
+                port: 5021
+              method: UpdateDemand
+              arguments:
+                id: ${ $context.order.id }
+                items: ${ $context.order.items }
+        - archiveOrder:
+            run:
+              container:
+                image: tools-cli:latest
+                command: archive
+                environment:
+                  ORDER: ${ $context.order.id }
+                  STORAGE: cold
       then: end
   - raiseDeliveryTimeout:
       raise:
