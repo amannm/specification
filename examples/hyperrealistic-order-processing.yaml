@@ -184,7 +184,7 @@ do:
                     TEMPLATE: payment-failed
           - raisePaymentDeclined:
               raise:
-                errorRef: paymentDeclined
+                error: paymentDeclined
       then: listenForPaymentConfirmation
   - listenForPaymentConfirmation:
       call: asyncapi
@@ -207,7 +207,7 @@ do:
             run:
               container:
                 image: packing-service:latest
-                command: ["pack", "${ $item.id }"]
+                command: ${ "pack \($item.id)" }
                 name: ${ "pack-\($item.id)-\($workflow.id)" }
                 lifetime:
                   cleanup: eventually
@@ -222,10 +222,9 @@ do:
         operationId: createShipment
         parameters:
           orderId: ${ $context.order.id }
-        body:
-          items: ${ $context.order.items }
         redirect: true
-        authentication: shippingApi
+        authentication:
+          use: shippingApi
       then: scheduleWarehouseTransfer
   - scheduleWarehouseTransfer:
       call: openapi
@@ -277,18 +276,17 @@ do:
         operationId: updateOrderStatus
         parameters:
           orderId: ${ $context.order.id }
-        body:
-          status: shipped
-        authentication: salesforce
+        authentication:
+          use: salesforce
       then: sendConfirmation
   - sendConfirmation:
       run:
-        script:
+        container:
           image: notifications-cli:1.0
-          cmd: ["send"]
-          arguments:
-            email: ${ $context.order.customer.email }
-            template: shipped
+          command: send
+          environment:
+            EMAIL: ${ $context.order.customer.email }
+            TEMPLATE: shipped
       then: waitForDelivery
   - waitForDelivery:
       listen:
@@ -309,9 +307,8 @@ do:
         operationId: updateOrderStatus
         parameters:
           orderId: ${ $context.order.id }
-        body:
-          status: delivered
-        authentication: salesforce
+        authentication:
+          use: salesforce
       then: grantLoyaltyPoints
   - grantLoyaltyPoints:
       call: openapi
@@ -321,20 +318,19 @@ do:
         operationId: addPoints
         parameters:
           customerId: ${ $context.order.customer.id }
-        body:
-          points: ${ $context.order.total / 10 }
-        authentication: loyaltyService
+        authentication:
+          use: loyaltyService
       then: finalizeCustomerExperience
   - finalizeCustomerExperience:
       fork:
         branches:
           - sendSatisfactionSurvey:
               run:
-                script:
+                container:
                   image: marketing-cli:latest
-                  cmd: ["survey"]
-                  arguments:
-                    email: ${ $context.order.customer.email }
+                  command: survey
+                  environment:
+                    EMAIL: ${ $context.order.customer.email }
           - updateAnalytics:
               call: http
               with:
@@ -416,9 +412,8 @@ do:
         operationId: updateOrderStatus
         parameters:
           orderId: ${ $context.order.id }
-        body:
-          status: returned
-        authentication: salesforce
+        authentication:
+          use: salesforce
       then: updateAccounting
   - updateAccounting:
       call: openapi
@@ -428,8 +423,6 @@ do:
         operationId: recordRefund
         parameters:
           orderId: ${ $context.order.id }
-        body:
-          amount: ${ $context.order.total }
       then: updateStock
   - updateStock:
       call: openapi
@@ -461,7 +454,7 @@ do:
       then: end
   - raiseDeliveryTimeout:
       raise:
-        errorRef: deliveryTimeout
+        error: deliveryTimeout
       then: end
   - raiseManufacturingTimeout:
       raise:

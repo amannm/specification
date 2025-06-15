@@ -185,7 +185,7 @@ do:
                     TEMPLATE: payment-failed
           - raisePaymentDeclined:
               raise:
-                errorRef: paymentDeclined
+                error: paymentDeclined
       then: listenForPaymentConfirmation
   - listenForPaymentConfirmation:
       call: asyncapi
@@ -208,7 +208,7 @@ do:
             run:
               container:
                 image: packing-service:latest
-                command: ["pack", "${ $item.id }"]
+                command: ${ "pack \($item.id)" }
                 name: ${ "pack-\($item.id)-\($workflow.id)" }
                 lifetime:
                   cleanup: eventually
@@ -223,10 +223,9 @@ do:
         operationId: createShipment
         parameters:
           orderId: ${ $context.order.id }
-        body:
-          items: ${ $context.order.items }
         redirect: true
-        authentication: shippingApi
+        authentication:
+          use: shippingApi
       then: scheduleWarehouseTransfer
   - scheduleWarehouseTransfer:
       call: openapi
@@ -278,18 +277,17 @@ do:
         operationId: updateOrderStatus
         parameters:
           orderId: ${ $context.order.id }
-        body:
-          status: shipped
-        authentication: salesforce
+        authentication:
+          use: salesforce
       then: sendConfirmation
   - sendConfirmation:
       run:
-        script:
+        container:
           image: notifications-cli:1.0
-          cmd: ["send"]
-          arguments:
-            email: ${ $context.order.customer.email }
-            template: shipped
+          command: send
+          environment:
+            EMAIL: ${ $context.order.customer.email }
+            TEMPLATE: shipped
       then: waitForDelivery
   - waitForDelivery:
       listen:
@@ -310,9 +308,8 @@ do:
         operationId: updateOrderStatus
         parameters:
           orderId: ${ $context.order.id }
-        body:
-          status: delivered
-        authentication: salesforce
+        authentication:
+          use: salesforce
       then: grantLoyaltyPoints
   - grantLoyaltyPoints:
       call: openapi
@@ -322,20 +319,19 @@ do:
         operationId: addPoints
         parameters:
           customerId: ${ $context.order.customer.id }
-        body:
-          points: ${ $context.order.total / 10 }
-        authentication: loyaltyService
+        authentication:
+          use: loyaltyService
       then: finalizeCustomerExperience
   - finalizeCustomerExperience:
       fork:
         branches:
           - sendSatisfactionSurvey:
               run:
-                script:
+                container:
                   image: marketing-cli:latest
-                  cmd: ["survey"]
-                  arguments:
-                    email: ${ $context.order.customer.email }
+                  command: survey
+                  environment:
+                    EMAIL: ${ $context.order.customer.email }
           - updateAnalytics:
               call: http
               with:
@@ -417,9 +413,8 @@ do:
         operationId: updateOrderStatus
         parameters:
           orderId: ${ $context.order.id }
-        body:
-          status: returned
-        authentication: salesforce
+        authentication:
+          use: salesforce
       then: updateAccounting
   - updateAccounting:
       call: openapi
@@ -429,8 +424,6 @@ do:
         operationId: recordRefund
         parameters:
           orderId: ${ $context.order.id }
-        body:
-          amount: ${ $context.order.total }
       then: updateStock
   - updateStock:
       call: openapi
@@ -470,17 +463,13 @@ do:
               operationId: updateOrder
               parameters:
                 orderId: ${ $context.order.id }
-              body:
-                status: completed
         - generateInvoice:
             run:
               container:
                 image: invoicing-cli:latest
-                command: ["generate-invoice"]
-                env:
+                command: ${ "generate-invoice \($context.order.id)" }
+                environment:
                   INVOICE_TOKEN: ${ $secrets.INVOICE_TOKEN }
-                arguments:
-                  - ${ $context.order.id }
                 lifetime:
                   cleanup: eventually
                   after:
@@ -497,8 +486,8 @@ do:
                 orderId: ${ $context.order.id }
                 total: ${ $context.order.total }
         - evaluateLoyaltyStatus:
-            evaluate:
-              result: "${ $context.order.total > 1000 ? 'gold' : 'standard' }"
+            set:
+              loyaltyStatus: "${ $context.order.total > 1000 ? 'gold' : 'standard' }"
         - updateDataWarehouse:
             run:
               workflow:
@@ -512,20 +501,20 @@ do:
               branches:
                 - sendPromoEmail:
                     run:
-                      script:
+                      container:
                         image: marketing-cli:latest
-                        cmd: ["email"]
-                        arguments:
-                          to: ${ $context.order.customer.email }
-                          template: upsell
+                        command: email
+                        environment:
+                          TO: ${ $context.order.customer.email }
+                          TEMPLATE: upsell
                 - sendPromoSMS:
                     run:
-                      script:
+                      container:
                         image: marketing-cli:latest
-                        cmd: ["sms"]
-                        arguments:
-                          phone: ${ $context.order.customer.phone }
-                          template: upsell
+                        command: sms
+                        environment:
+                          PHONE: ${ $context.order.customer.phone }
+                          TEMPLATE: upsell
                 - updateAdCampaign:
                     call: openapi
                     with:
@@ -542,7 +531,7 @@ do:
                 endpoint: file://protos/procurement.proto
               service:
                 name: ProcurementApi.Manager
-                host: procurement.example.com
+                host: procurement-example-com
                 port: 5021
               method: UpdateDemand
               arguments:
@@ -550,16 +539,16 @@ do:
                 items: ${ $context.order.items }
         - archiveOrder:
             run:
-              script:
+              container:
                 image: tools-cli:latest
-                cmd: ["archive"]
-                arguments:
-                  order: ${ $context.order.id }
-                  storage: cold
+                command: archive
+                environment:
+                  ORDER: ${ $context.order.id }
+                  STORAGE: cold
       then: end
   - raiseDeliveryTimeout:
       raise:
-        errorRef: deliveryTimeout
+        error: deliveryTimeout
       then: end
   - raiseManufacturingTimeout:
       raise:
