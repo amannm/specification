@@ -2,8 +2,8 @@
 document:
   dsl: '1.0.0'
   namespace: business
-  name: hyperrealistic-order-processing
-  version: '0.3.0'
+  name: hyperrealistic-order-with-fraud
+  version: '0.4.0'
 input:
   from:
     order: .order
@@ -17,10 +17,27 @@ input:
           type: object
 use:
   secrets:
+    - ML_TOKEN
+    - NOTIFICATION_TOKEN
     - SHIPPING_TOKEN
     - ANALYTICS_TOKEN
     - INVOICE_TOKEN
   authentications:
+    riskApi:
+      oauth2:
+        authority: https://risk.mybank.com
+        endpoints:
+          token: /oauth/token
+        grant: client_credentials
+        client:
+          id: risk-client-id
+          secret: risk-client-secret
+    identityService:
+      bearer:
+        use: ML_TOKEN
+    notificationService:
+      bearer:
+        use: NOTIFICATION_TOKEN
     shippingApi:
       bearer:
         use: SHIPPING_TOKEN
@@ -54,19 +71,19 @@ use:
         client:
           id: loyalty-client-id
           secret: loyalty-client-secret
-  errors:
-    itemOutOfStock:
-      type: https://ecommerce.example.com/errors/out-of-stock
-      status: 409
-      title: Item Out of Stock
-    deliveryTimeout:
-      type: https://ecommerce.example.com/errors/delivery-timeout
-      status: 504
-      title: Delivery Timeout
-    paymentDeclined:
-      type: https://ecommerce.example.com/errors/payment-declined
-      status: 402
-      title: Payment Declined
+errors:
+  itemOutOfStock:
+    type: https://ecommerce.example.com/errors/out-of-stock
+    status: 409
+    title: Item Out of Stock
+  deliveryTimeout:
+    type: https://ecommerce.example.com/errors/delivery-timeout
+    status: 504
+    title: Delivery Timeout
+  paymentDeclined:
+    type: https://ecommerce.example.com/errors/payment-declined
+    status: 402
+    title: Payment Declined
 schedule:
   on:
     one:
@@ -77,6 +94,162 @@ do:
   - initializeContext:
       set:
         order: ${ $workflow.input.order }
+        transaction: ${ $workflow.input.order.transaction }
+  - parallelFraudChecks:
+      fork:
+        branches:
+          - checkVelocity:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://velocity.mybank.com/openapi.yaml
+                operationId: checkVelocity
+                parameters:
+                  accountId: ${ $context.transaction.account.id }
+                  amount: ${ $context.transaction.amount }
+              output:
+                as: .velocityResult
+          - evaluateRiskScore:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://risk.mybank.com/openapi.yaml
+                operationId: computeScore
+                parameters:
+                  transactionId: ${ $context.transaction.id }
+                authentication:
+                  use: riskApi
+              output:
+                as: .riskScore
+          - verifyIdentity:
+              run:
+                container:
+                  image: identity-checker:latest
+                  command: verify
+                  environment:
+                    DOCUMENT: ${ $context.transaction.identityDocument }
+                  lifetime:
+                    cleanup: eventually
+                    after:
+                      minutes: 15
+              output:
+                as: .identityResult
+          - analyzeBehavior:
+              run:
+                workflow:
+                  namespace: analytics
+                  name: behavior-analysis
+                  version: '0.1.0'
+                  input:
+                    transaction: ${ $context.transaction }
+              output:
+                as: .behaviorOutput
+  - decideFraud:
+      switch:
+        - highRisk:
+            when: ${ $context.riskScore > 0.8 || $context.velocityResult.flagged || $context.identityResult.suspicious }
+            then: escalateToManualReview
+        - moderateRisk:
+            when: ${ $context.riskScore > 0.5 }
+            then: collectAdditionalData
+        - lowRisk:
+            when: ${ $context.riskScore <= 0.5 }
+            then: approveTransaction
+  - escalateToManualReview:
+      call: http
+      with:
+        method: post
+        endpoint:
+          uri: https://operations.mybank.com/manual-review
+        body:
+          transaction: ${ $context.transaction }
+      then: waitForManualDecision
+  - collectAdditionalData:
+      run:
+        container:
+          image: enrichment-cli:latest
+          command: enrich
+          environment:
+            TRANSACTION_ID: ${ $context.transaction.id }
+      then: escalateToManualReview
+  - waitForManualDecision:
+      listen:
+        to:
+          one:
+            with:
+              type: com.mybank.events.transaction.reviewed.v1
+              data: ${ .transactionId == $context.transaction.id }
+      timeout:
+        after:
+          hours: 12
+      then: finalizeDecision
+  - approveTransaction:
+      call: http
+      with:
+        method: post
+        endpoint:
+          uri: https://payments.mybank.com/approve
+        body:
+          transactionId: ${ $context.transaction.id }
+      then: parallelPreProcessing
+  - finalizeDecision:
+      switch:
+        - approved:
+            when: ${ .data.status == 'approved' }
+            then: approveTransaction
+        - rejected:
+            when: ${ .data.status == 'rejected' }
+            then: denyTransaction
+        - expired:
+            when: ${ true }
+            then: raiseManualTimeout
+  - denyTransaction:
+      call: http
+      with:
+        method: post
+        endpoint:
+          uri: https://payments.mybank.com/deny
+        body:
+          transactionId: ${ $context.transaction.id }
+      then: notifyFraudOutcome
+  - notifyFraudOutcome:
+      fork:
+        branches:
+          - sendEmail:
+              run:
+                container:
+                  image: notification-cli:latest
+                  command: email
+                  environment:
+                    TOKEN: ${ $secrets.NOTIFICATION_TOKEN }
+                    EMAIL: ${ $context.transaction.customer.email }
+                    TEMPLATE: transaction-status
+          - updateCRM:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://crm.mybank.com/openapi.yaml
+                operationId: updateTransactionStatus
+                parameters:
+                  transactionId: ${ $context.transaction.id }
+      then: recordFraudResult
+  - recordFraudResult:
+      emit:
+        event:
+          with:
+            source: https://fraud.mybank.com
+            type: com.mybank.events.transaction.processed.v1
+            data:
+              transactionId: ${ $context.transaction.id }
+              decision: ${ $context.finalDecision }
+      then: end
+  - raiseManualTimeout:
+      raise:
+        error:
+          type: https://fraud.mybank.com/errors/manual-timeout
+          status: 504
+          title: Manual Review Timeout
+      then: end
   - parallelPreProcessing:
       fork:
         branches:
