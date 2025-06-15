@@ -90,6 +90,16 @@ do:
                   customerId: ${ $context.order.customer.id }
               output:
                 as: .customerInfo
+          - validateShippingAddress:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://address.example.com/openapi.yaml
+                operationId: verifyAddress
+                parameters:
+                  address: ${ $context.order.shippingAddress }
+              output:
+                as: .validatedAddress
           - applyCoupons:
               call: http
               with:
@@ -563,6 +573,15 @@ do:
                       parameters:
                         campaignId: 42
                         orderId: ${ $context.order.id }
+                - updateCustomerSegmentation:
+                    call: openapi
+                    with:
+                      document:
+                        endpoint: https://marketing.example.com/openapi.yaml
+                      operationId: updateSegment
+                      parameters:
+                        customerId: ${ $context.order.customer.id }
+                        segment: ${ $context.loyaltyStatus }
         - orchestrateProcurement:
             call: grpc
             with:
