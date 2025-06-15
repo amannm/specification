@@ -3,7 +3,7 @@ document:
   dsl: '1.0.0'
   namespace: business
   name: hyperrealistic-order-processing
-  version: '0.2.0'
+  version: '0.3.0'
 input:
   from:
     order: .order
@@ -67,26 +67,50 @@ use:
       type: https://ecommerce.example.com/errors/payment-declined
       status: 402
       title: Payment Declined
-  extensions:
-    - logDuration:
-        extend: run
-        after:
-          - log:
-              run:
-                script:
-                  language: bash
-                  code: |
-                    echo "Task took $TASK_DURATION seconds"
 schedule:
   on:
     one:
       with:
-        type: com.ecommerce.events.order.placed.v1
+        type: com.ecommerce.events.order.placed.v2
         data: ${ .orderId != null }
 do:
-  - initializeOrder:
+  - initializeContext:
       set:
         order: ${ $workflow.input.order }
+  - verifyCustomerInfo:
+      call: openapi
+      with:
+        document:
+          endpoint: https://crm.example.com/openapi.yaml
+        operationId: validateCustomer
+        parameters:
+          customerId: ${ $context.order.customer.id }
+      output:
+        as: .customerInfo
+  - applyCoupons:
+      call: http
+      with:
+        method: post
+        endpoint:
+          uri: https://coupons.example.com/apply
+        headers:
+          content-type: application/json
+        body:
+          orderId: ${ $context.order.id }
+          coupons: ${ $context.order.coupons }
+      output:
+        as: .couponResult
+  - calculateTaxes:
+      call: openapi
+      with:
+        document:
+          endpoint: https://taxes.example.com/openapi.yaml
+        operationId: computeTaxes
+        parameters:
+          orderId: ${ $context.order.id }
+          items: ${ $context.order.items }
+      output:
+        as: .taxes
   - publishOrderCreated:
       call: asyncapi
       with:
@@ -97,7 +121,7 @@ do:
         message:
           payload:
             order: ${ $context.order }
-  - verifyInventory:
+  - checkInventory:
       call: openapi
       with:
         document:
@@ -107,7 +131,7 @@ do:
           ids: ${ $context.order.items[*].id }
       output:
         as: .inventory
-  - checkInventory:
+  - handleInventory:
       switch:
         - available:
             when: ${ all($context.inventory[*].status == 'available') }
@@ -153,8 +177,8 @@ do:
         operationId: evaluateOrderRisk
         parameters:
           orderId: ${ $context.order.id }
-      then: chargeCustomer
-  - chargeCustomer:
+      then: initiatePayment
+  - initiatePayment:
       try:
         - attemptCharge:
             call: http
@@ -186,8 +210,8 @@ do:
           - raisePaymentDeclined:
               raise:
                 error: paymentDeclined
-      then: listenForPaymentConfirmation
-  - listenForPaymentConfirmation:
+      then: awaitPaymentConfirmation
+  - awaitPaymentConfirmation:
       call: asyncapi
       with:
         document:
@@ -449,7 +473,7 @@ do:
         event:
           with:
             source: https://ecommerce.example.com
-            type: com.ecommerce.events.order.completed.v1
+            type: com.ecommerce.events.order.completed.v2
             data:
               orderId: ${ $context.order.id }
       then: finalEnterpriseProcesses
@@ -485,6 +509,13 @@ do:
               body:
                 orderId: ${ $context.order.id }
                 total: ${ $context.order.total }
+        - recordAudit:
+            run:
+              container:
+                image: audit-cli:latest
+                command: record
+                environment:
+                  ORDER: ${ $context.order.id }
         - evaluateLoyaltyStatus:
             set:
               loyaltyStatus: "${ $context.order.total > 1000 ? 'gold' : 'standard' }"
@@ -564,7 +595,6 @@ do:
           status: 504
           title: Shipping Timeout
       then: end
-
 timeout:
   after:
     hours: 2
