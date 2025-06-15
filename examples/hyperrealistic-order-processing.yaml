@@ -84,20 +84,22 @@ do:
               call: openapi
               with:
                 document:
-                  endpoint: https://api.salesforce.com/openapi.yaml
+                  endpoint: https://crm.mycorp.com/salesforce/openapi.yaml
                 operationId: validateCustomer
                 parameters:
                   customerId: ${ $context.order.customer.id }
+                  tier: retail
               output:
                 as: .customerInfo
           - validateShippingAddress:
               call: openapi
               with:
                 document:
-                  endpoint: https://maps.googleapis.com/openapi.yaml
+                  endpoint: https://geo.mycorp.com/maps/openapi.yaml
                 operationId: verifyAddress
                 parameters:
                   address: ${ $context.order.shippingAddress }
+                  region: US
               output:
                 as: .validatedAddress
           - applyCoupons:
@@ -105,9 +107,10 @@ do:
               with:
                 method: post
                 endpoint:
-                  uri: https://api.shopify.com/discounts/apply
+                  uri: https://storefront.mycorp.com/discounts/apply
                 headers:
                   content-type: application/json
+                  x-shop-token: ${ $secrets.SHOP_TOKEN }
                 body:
                   orderId: ${ $context.order.id }
                   coupons: ${ $context.order.coupons }
@@ -117,31 +120,34 @@ do:
               call: openapi
               with:
                 document:
-                  endpoint: https://api.avalara.com/openapi.yaml
+                  endpoint: https://taxes.mycorp.com/openapi.yaml
                 operationId: computeTaxes
                 parameters:
                   orderId: ${ $context.order.id }
                   items: ${ $context.order.items }
+                  state: ${ $context.order.shippingAddress.state }
               output:
                 as: .taxes
           - publishOrderCreated:
               call: asyncapi
               with:
                 document:
-                  endpoint: https://confluent.cloud/asyncapi.json
+                  endpoint: https://messaging.mycorp.com/asyncapi.json
                 operation: publishOrderCreated
                 protocol: kafka
                 message:
+                  key: ${ $context.order.id }
                   payload:
                     order: ${ $context.order }
           - checkInventory:
               call: openapi
               with:
                 document:
-                  endpoint: https://api.sap.com/inventory/openapi.json
+                  endpoint: https://inventory.mycorp.com/openapi.json
                 operationId: checkInventory
                 parameters:
                   ids: ${ $context.order.items[*].id }
+                  warehouse: central
               output:
                 as: .inventory
   - handleInventory:
@@ -156,11 +162,12 @@ do:
       call: openapi
       with:
         document:
-          endpoint: https://api.siemens.com/opcenter/openapi.yaml
+          endpoint: https://factory.mycorp.com/opcenter/openapi.yaml
         operationId: createWorkOrder
         parameters:
           orderId: ${ $context.order.id }
           items: ${ $context.order.items }
+          priority: high
       then: waitForManufacturing
   - waitForManufacturing:
       listen:
@@ -177,19 +184,21 @@ do:
       call: openapi
       with:
         document:
-          endpoint: https://api.sap.com/inventory/openapi.json
+          endpoint: https://inventory.mycorp.com/openapi.json
         operationId: updateStock
         parameters:
           ids: ${ $context.order.items[*].id }
+          source: manufacturing
       then: assessRisk
   - assessRisk:
       call: openapi
       with:
         document:
-          endpoint: https://api.riskified.com/openapi.yaml
+          endpoint: https://risk.mycorp.com/openapi.yaml
         operationId: evaluateOrderRisk
         parameters:
           orderId: ${ $context.order.id }
+          threshold: 0.7
       then: initiatePayment
   - initiatePayment:
       try:
@@ -203,6 +212,7 @@ do:
                   use: paymentService
               headers:
                 content-type: application/x-www-form-urlencoded
+                idempotency-key: ${ $context.order.id }
               body:
                 amount: ${ $context.order.total * 100 }
                 currency: usd
@@ -228,7 +238,7 @@ do:
       call: asyncapi
       with:
         document:
-          endpoint: https://confluent.cloud/asyncapi.json
+          endpoint: https://messaging.mycorp.com/asyncapi.json
         operation: paymentProcessed
         protocol: kafka
         subscription:
@@ -256,7 +266,7 @@ do:
       call: openapi
       with:
         document:
-          endpoint: https://api.fedex.com/openapi.yaml
+          endpoint: https://shipping.mycorp.com/fedex/openapi.yaml
         operationId: createShipment
         parameters:
           orderId: ${ $context.order.id }
@@ -268,7 +278,7 @@ do:
       call: openapi
       with:
         document:
-          endpoint: https://api.fedex.com/openapi.yaml
+          endpoint: https://shipping.mycorp.com/fedex/openapi.yaml
         operationId: routeToWarehouse
         parameters:
           orderId: ${ $context.order.id }
@@ -313,7 +323,7 @@ do:
               call: openapi
               with:
                 document:
-                  endpoint: https://api.salesforce.com/openapi.yaml
+                  endpoint: https://crm.mycorp.com/openapi.yaml
                 operationId: updateOrderStatus
                 parameters:
                   orderId: ${ $context.order.id }
@@ -327,6 +337,7 @@ do:
                   environment:
                     EMAIL: ${ $context.order.customer.email }
                     TEMPLATE: shipped
+                    SUBJECT: "Your order ${$context.order.id} has shipped"
       then: waitForDelivery
   - waitForDelivery:
       listen:
@@ -343,7 +354,7 @@ do:
       call: openapi
       with:
         document:
-          endpoint: https://api.salesforce.com/openapi.yaml
+          endpoint: https://crm.mycorp.com/openapi.yaml
         operationId: updateOrderStatus
         parameters:
           orderId: ${ $context.order.id }
@@ -354,10 +365,11 @@ do:
       call: openapi
       with:
         document:
-          endpoint: https://api.smile.io/openapi.yaml
+          endpoint: https://loyalty.mycorp.com/openapi.yaml
         operationId: addPoints
         parameters:
           customerId: ${ $context.order.customer.id }
+          points: ${ $context.order.total }
         authentication:
           use: loyaltyService
       then: finalizeCustomerExperience
@@ -376,7 +388,7 @@ do:
               with:
                 method: post
                 endpoint:
-                  uri: https://api.segment.com/v1/orders
+                  uri: https://analytics.mycorp.com/v1/orders
                   authentication:
                     use: analyticsApi
                 body:
@@ -387,29 +399,32 @@ do:
       call: openapi
       with:
         document:
-          endpoint: https://api.sap.com/supply/openapi.yaml
+          endpoint: https://supply.mycorp.com/openapi.yaml
         operationId: analyzeDemand
         parameters:
           orderId: ${ $context.order.id }
+          forecast: monthly
       then: checkSupplierCapacity
   - checkSupplierCapacity:
       call: openapi
       with:
         document:
-          endpoint: https://api.sap.com/supply/openapi.yaml
+          endpoint: https://supply.mycorp.com/openapi.yaml
         operationId: checkSuppliers
         parameters:
           orderId: ${ $context.order.id }
+          region: NA
       then: adjustProductionPlan
   - adjustProductionPlan:
       call: openapi
       with:
         document:
-          endpoint: https://api.siemens.com/opcenter/openapi.yaml
+          endpoint: https://factory.mycorp.com/opcenter/openapi.yaml
         operationId: updateProductionPlan
         parameters:
           orderId: ${ $context.order.id }
           demand: ${ $context.order.total }
+          mode: auto
       then: monitorReturns
   - monitorReturns:
       listen:
@@ -443,6 +458,7 @@ do:
           content-type: application/x-www-form-urlencoded
         body:
           payment_intent: ${ $context.order.paymentIntent }
+          reason: requested_by_customer
       then: postRefundActions
   - postRefundActions:
       fork:
@@ -451,7 +467,7 @@ do:
               call: openapi
               with:
                 document:
-                  endpoint: https://api.salesforce.com/openapi.yaml
+                  endpoint: https://crm.mycorp.com/openapi.yaml
                 operationId: updateOrderStatus
                 parameters:
                   orderId: ${ $context.order.id }
@@ -469,7 +485,7 @@ do:
               call: openapi
               with:
                 document:
-                  endpoint: https://api.sap.com/inventory/openapi.json
+                  endpoint: https://inventory.mycorp.com/openapi.json
                 operationId: restock
                 parameters:
                   ids: ${ $context.order.items[*].id }
@@ -477,7 +493,7 @@ do:
               call: openapi
               with:
                 document:
-                  endpoint: https://api.alibaba.com/openapi.yaml
+                  endpoint: https://suppliers.mycorp.com/openapi.yaml
                 operationId: notifyReturn
                 parameters:
                   orderId: ${ $context.order.id }
@@ -501,10 +517,11 @@ do:
                     call: openapi
                     with:
                       document:
-                        endpoint: https://api.sap.com/erp/openapi.yaml
+                        endpoint: https://erp.mycorp.com/openapi.yaml
                       operationId: updateOrder
                       parameters:
                         orderId: ${ $context.order.id }
+                        sync: true
                 - generateInvoice:
                     run:
                       container:
@@ -521,9 +538,10 @@ do:
                     with:
                       method: post
                       endpoint:
-                        uri: https://api.onetrust.com/report
+                        uri: https://compliance.mycorp.com/report
                       headers:
                         content-type: application/json
+                        x-api-key: ${ $secrets.INVOICE_TOKEN }
                       body:
                         orderId: ${ $context.order.id }
                         total: ${ $context.order.total }
@@ -568,7 +586,7 @@ do:
                     call: openapi
                     with:
                       document:
-                        endpoint: https://ads.google.com/openapi.yaml
+                        endpoint: https://ads.mycorp.com/openapi.yaml
                       operationId: recordConversion
                       parameters:
                         campaignId: 42
@@ -577,7 +595,7 @@ do:
                     call: openapi
                     with:
                       document:
-                        endpoint: https://api.hubspot.com/openapi.yaml
+                        endpoint: https://marketing.mycorp.com/openapi.yaml
                       operationId: updateSegment
                       parameters:
                         customerId: ${ $context.order.customer.id }
@@ -589,7 +607,7 @@ do:
                 endpoint: file://protos/procurement.proto
               service:
                 name: ProcurementApi.Manager
-                host: sap-procurement
+                host: procurement.mycorp.internal
                 port: 5021
               method: UpdateDemand
               arguments:
@@ -603,6 +621,7 @@ do:
                 environment:
                   ORDER: ${ $context.order.id }
                   STORAGE: cold
+                  RETENTION: 365
       then: end
   - raiseDeliveryTimeout:
       raise:
