@@ -77,60 +77,63 @@ do:
   - initializeContext:
       set:
         order: ${ $workflow.input.order }
-  - verifyCustomerInfo:
-      call: openapi
-      with:
-        document:
-          endpoint: https://crm.example.com/openapi.yaml
-        operationId: validateCustomer
-        parameters:
-          customerId: ${ $context.order.customer.id }
-      output:
-        as: .customerInfo
-  - applyCoupons:
-      call: http
-      with:
-        method: post
-        endpoint:
-          uri: https://coupons.example.com/apply
-        headers:
-          content-type: application/json
-        body:
-          orderId: ${ $context.order.id }
-          coupons: ${ $context.order.coupons }
-      output:
-        as: .couponResult
-  - calculateTaxes:
-      call: openapi
-      with:
-        document:
-          endpoint: https://taxes.example.com/openapi.yaml
-        operationId: computeTaxes
-        parameters:
-          orderId: ${ $context.order.id }
-          items: ${ $context.order.items }
-      output:
-        as: .taxes
-  - publishOrderCreated:
-      call: asyncapi
-      with:
-        document:
-          endpoint: https://messaging.example.com/asyncapi.json
-        operation: publishOrderCreated
-        protocol: kafka
-        message:
-          payload:
-            order: ${ $context.order }
-  - checkInventory:
-      call: openapi
-      with:
-        document:
-          endpoint: https://inventory.example.com/openapi.json
-        operationId: checkInventory
-        parameters:
-          ids: ${ $context.order.items[*].id }
-      output:
-        as: .inventory
+  - parallelPreProcessing:
+      fork:
+        branches:
+          - verifyCustomerInfo:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://crm.example.com/openapi.yaml
+                operationId: validateCustomer
+                parameters:
+                  customerId: ${ $context.order.customer.id }
+              output:
+                as: .customerInfo
+          - applyCoupons:
+              call: http
+              with:
+                method: post
+                endpoint:
+                  uri: https://coupons.example.com/apply
+                headers:
+                  content-type: application/json
+                body:
+                  orderId: ${ $context.order.id }
+                  coupons: ${ $context.order.coupons }
+              output:
+                as: .couponResult
+          - calculateTaxes:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://taxes.example.com/openapi.yaml
+                operationId: computeTaxes
+                parameters:
+                  orderId: ${ $context.order.id }
+                  items: ${ $context.order.items }
+              output:
+                as: .taxes
+          - publishOrderCreated:
+              call: asyncapi
+              with:
+                document:
+                  endpoint: https://messaging.example.com/asyncapi.json
+                operation: publishOrderCreated
+                protocol: kafka
+                message:
+                  payload:
+                    order: ${ $context.order }
+          - checkInventory:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://inventory.example.com/openapi.json
+                operationId: checkInventory
+                parameters:
+                  ids: ${ $context.order.items[*].id }
+              output:
+                as: .inventory
   - handleInventory:
       switch:
         - available:
@@ -292,26 +295,28 @@ do:
       timeout:
         after:
           hours: 24
-      then: updateCRM
-  - updateCRM:
-      call: openapi
-      with:
-        document:
-          endpoint: https://salesforce.example.com/openapi.yaml
-        operationId: updateOrderStatus
-        parameters:
-          orderId: ${ $context.order.id }
-        authentication:
-          use: salesforce
-      then: sendConfirmation
-  - sendConfirmation:
-      run:
-        container:
-          image: notifications-cli:1.0
-          command: send
-          environment:
-            EMAIL: ${ $context.order.customer.email }
-            TEMPLATE: shipped
+      then: notifyCustomer
+  - notifyCustomer:
+      fork:
+        branches:
+          - updateCRM:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://salesforce.example.com/openapi.yaml
+                operationId: updateOrderStatus
+                parameters:
+                  orderId: ${ $context.order.id }
+                authentication:
+                  use: salesforce
+          - sendConfirmation:
+              run:
+                container:
+                  image: notifications-cli:1.0
+                  command: send
+                  environment:
+                    EMAIL: ${ $context.order.customer.email }
+                    TEMPLATE: shipped
       then: waitForDelivery
   - waitForDelivery:
       listen:
@@ -428,45 +433,45 @@ do:
           content-type: application/x-www-form-urlencoded
         body:
           payment_intent: ${ $context.order.paymentIntent }
-      then: updateCRMReturn
-  - updateCRMReturn:
-      call: openapi
-      with:
-        document:
-          endpoint: https://salesforce.example.com/openapi.yaml
-        operationId: updateOrderStatus
-        parameters:
-          orderId: ${ $context.order.id }
-        authentication:
-          use: salesforce
-      then: updateAccounting
-  - updateAccounting:
-      call: openapi
-      with:
-        document:
-          endpoint: https://accounting.example.com/openapi.yaml
-        operationId: recordRefund
-        parameters:
-          orderId: ${ $context.order.id }
-      then: updateStock
-  - updateStock:
-      call: openapi
-      with:
-        document:
-          endpoint: https://inventory.example.com/openapi.json
-        operationId: restock
-        parameters:
-          ids: ${ $context.order.items[*].id }
-      then: notifySuppliers
-  - notifySuppliers:
-      call: openapi
-      with:
-        document:
-          endpoint: https://suppliers.example.com/openapi.yaml
-        operationId: notifyReturn
-        parameters:
-          orderId: ${ $context.order.id }
-          items: ${ $context.order.items }
+      then: postRefundActions
+  - postRefundActions:
+      fork:
+        branches:
+          - updateCRMReturn:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://salesforce.example.com/openapi.yaml
+                operationId: updateOrderStatus
+                parameters:
+                  orderId: ${ $context.order.id }
+                authentication:
+                  use: salesforce
+          - updateAccounting:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://accounting.example.com/openapi.yaml
+                operationId: recordRefund
+                parameters:
+                  orderId: ${ $context.order.id }
+          - updateStock:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://inventory.example.com/openapi.json
+                operationId: restock
+                parameters:
+                  ids: ${ $context.order.items[*].id }
+          - notifySuppliers:
+              call: openapi
+              with:
+                document:
+                  endpoint: https://suppliers.example.com/openapi.yaml
+                operationId: notifyReturn
+                parameters:
+                  orderId: ${ $context.order.id }
+                  items: ${ $context.order.items }
       then: emitCompletion
   - emitCompletion:
       emit:
@@ -479,54 +484,57 @@ do:
       then: finalEnterpriseProcesses
   - finalEnterpriseProcesses:
       do:
-        - updateERP:
-            call: openapi
-            with:
-              document:
-                endpoint: https://erp.example.com/openapi.yaml
-              operationId: updateOrder
-              parameters:
-                orderId: ${ $context.order.id }
-        - generateInvoice:
-            run:
-              container:
-                image: invoicing-cli:latest
-                command: ${ "generate-invoice \($context.order.id)" }
-                environment:
-                  INVOICE_TOKEN: ${ $secrets.INVOICE_TOKEN }
-                lifetime:
-                  cleanup: eventually
-                  after:
-                    minutes: 5
-        - notifyCompliance:
-            call: http
-            with:
-              method: post
-              endpoint:
-                uri: https://compliance.example.com/report
-              headers:
-                content-type: application/json
-              body:
-                orderId: ${ $context.order.id }
-                total: ${ $context.order.total }
-        - recordAudit:
-            run:
-              container:
-                image: audit-cli:latest
-                command: record
-                environment:
-                  ORDER: ${ $context.order.id }
-        - evaluateLoyaltyStatus:
-            set:
-              loyaltyStatus: "${ $context.order.total > 1000 ? 'gold' : 'standard' }"
-        - updateDataWarehouse:
-            run:
-              workflow:
-                namespace: analytics
-                name: data-warehouse-ingest
-                version: "0.1.0"
-                input:
-                  order: ${ $context.order }
+        - enterpriseParallel:
+            fork:
+              branches:
+                - updateERP:
+                    call: openapi
+                    with:
+                      document:
+                        endpoint: https://erp.example.com/openapi.yaml
+                      operationId: updateOrder
+                      parameters:
+                        orderId: ${ $context.order.id }
+                - generateInvoice:
+                    run:
+                      container:
+                        image: invoicing-cli:latest
+                        command: ${ "generate-invoice \($context.order.id)" }
+                        environment:
+                          INVOICE_TOKEN: ${ $secrets.INVOICE_TOKEN }
+                        lifetime:
+                          cleanup: eventually
+                          after:
+                            minutes: 5
+                - notifyCompliance:
+                    call: http
+                    with:
+                      method: post
+                      endpoint:
+                        uri: https://compliance.example.com/report
+                      headers:
+                        content-type: application/json
+                      body:
+                        orderId: ${ $context.order.id }
+                        total: ${ $context.order.total }
+                - recordAudit:
+                    run:
+                      container:
+                        image: audit-cli:latest
+                        command: record
+                        environment:
+                          ORDER: ${ $context.order.id }
+                - evaluateLoyaltyStatus:
+                    set:
+                      loyaltyStatus: "${ $context.order.total > 1000 ? 'gold' : 'standard' }"
+                - updateDataWarehouse:
+                    run:
+                      workflow:
+                        namespace: analytics
+                        name: data-warehouse-ingest
+                        version: "0.1.0"
+                        input:
+                          order: ${ $context.order }
         - sendMarketing:
             fork:
               branches:
